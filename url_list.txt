@@ -1,0 +1,6 @@
+#https://onlineradiobox.com/fi/suomipop/playlist/1
+#https://onlineradiobox.com/fi/suomirock/playlist/1
+#https://onlineradiobox.com/fi/rock/playlist/1
+#https://onlineradiobox.com/se/nrj/playlist/1
+https://onlineradiobox.com/fr/nrjfrance/playlist/1
+#https://onlineradiobox.com/fr/skyrock/playlist/1
