@@ -2,7 +2,7 @@
 """
 Radio playlist scraper → YouTube Music playlist creator.
 
-Reads url_list.txt (onlineradiobox.com playlist URLs),
+Reads url_list.json (onlineradiobox.com playlist URLs),
 scrapes songs played in the last 24h per station, ranks each station's
 songs by play count, then creates one public YouTube Music playlist per station.
 
@@ -10,6 +10,8 @@ Setup (one-time):
     pip install requests beautifulsoup4 ytmusicapi
     ytmusicapi browser --file browser.json
 """
+
+from __future__ import annotations
 
 import json
 import logging
@@ -24,12 +26,60 @@ import requests
 from bs4 import BeautifulSoup
 
 
-URL_FILE = "url_list.txt"
+URL_FILE = "url_list.json"
 CONFIG_FILE = "radio_config.json"
 LOG_FILE = "radio_playlist.log"
 # onlineradiobox.com rate-limits aggressive scrapers; randomised delays keep us under the radar
 REQUEST_DELAY_MIN = 8.0
 REQUEST_DELAY_MAX = 14.0
+
+# Maps onlineradiobox.com country codes to lingua Language enum names.
+# Stations in countries not listed here are not filtered by language.
+COUNTRY_TO_LINGUA_LANGUAGE = {
+    "nl": "DUTCH",
+    "be": ["DUTCH", "FRENCH", "GERMAN"],
+    "fr": "FRENCH",
+    "de": "GERMAN",
+    "es": "SPANISH",
+    "se": "SWEDISH",
+    "no": "NORWEGIAN",
+    "dk": "DANISH",
+    "pt": "PORTUGUESE",
+    "it": "ITALIAN",
+    "pl": "POLISH",
+    "ru": "RUSSIAN",
+    "hr": "CROATIAN",
+    "cs": "CZECH",
+    "sk": "SLOVAK",
+    "hu": "HUNGARIAN",
+    "ro": "ROMANIAN",
+    "uk": "UKRAINIAN",
+    "lt": "LITHUANIAN",
+    "lv": "LATVIAN",
+    "et": "ESTONIAN",
+}
+
+
+def wait_for_network(
+    host: str = "onlineradiobox.com",
+    retries: int = 10,
+    delay: float = 30.0,
+) -> bool:
+    """
+    Block until the host resolves successfully, or give up after retries attempts.
+    Returns True if network is available, False if all retries are exhausted.
+    """
+    import socket
+    for attempt in range(1, retries + 1):
+        try:
+            socket.getaddrinfo(host, 443)
+            if attempt > 1:
+                print(f"Network available after {attempt} attempts.")
+            return True
+        except OSError:
+            print(f"Network not ready (attempt {attempt}/{retries}), retrying in {delay:.0f}s…")
+            time.sleep(delay)
+    return False
 
 
 def read_config(path: str) -> dict:
@@ -41,9 +91,10 @@ def read_config(path: str) -> dict:
         sys.exit(1)
 
 
-def read_urls(path: str) -> list[str]:
+def read_urls(path: str) -> list[dict]:
     with open(path) as f:
-        return [line.strip() for line in f if line.strip() and line.strip().startswith("http")]
+        entries = json.load(f)
+    return [e for e in entries if e.get("enabled", True)]
 
 
 def fetch_playlist(url: str, session: requests.Session) -> tuple[str, list[tuple[str, str]]]:
@@ -124,6 +175,71 @@ def _country_from_url(url: str) -> str:
     return parts[0].upper() if parts else ""
 
 
+def _language_label_for_country(country_code: str) -> str | None:
+    """Return a human-readable language label for a country code, or None if not mapped."""
+    entry = COUNTRY_TO_LINGUA_LANGUAGE.get(country_code.lower())
+    if entry is None:
+        return None
+    if isinstance(entry, list):
+        return "/".join(name.title() for name in entry)
+    return entry.title()
+
+
+def build_language_detector():
+    """Build a lingua language detector. Returns None if lingua is not installed."""
+    try:
+        from lingua import LanguageDetectorBuilder
+        return LanguageDetectorBuilder.from_all_languages().build()
+    except ImportError:
+        print("Warning: lingua-language-detector not installed; language filtering disabled.", file=sys.stderr)
+        print("  Run: pip install lingua-language-detector", file=sys.stderr)
+        return None
+
+
+def filter_songs_by_language(
+    songs: list[tuple[str, str]],
+    country_code: str,
+    detector,
+) -> list[tuple[str, str]]:
+    """
+    Remove songs whose title is detectably in a different language than expected
+    for the given country code.
+
+    Songs with inconclusive detection (title too short / ambiguous) are kept to
+    avoid false negatives. Only songs whose language is positively identified as
+    something other than the target language(s) are dropped.
+    """
+    if detector is None or not country_code:
+        return songs
+
+    entry = COUNTRY_TO_LINGUA_LANGUAGE.get(country_code.lower())
+    if entry is None:
+        return songs  # No language expectation for this country
+
+    try:
+        from lingua import Language
+    except ImportError:
+        return songs
+
+    if isinstance(entry, list):
+        target_langs = {getattr(Language, name) for name in entry}
+    else:
+        target_langs = {getattr(Language, entry)}
+
+    filtered = []
+    removed = 0
+    for artist, title in songs:
+        detected = detector.detect_language_of(title)
+        if detected is None or detected in target_langs:
+            filtered.append((artist, title))
+        else:
+            removed += 1
+
+    if removed:
+        print(f"  Language filter: removed {removed} non-{'/'.join(e if isinstance(e, str) else e for e in ([entry] if isinstance(entry, str) else entry))} songs.")
+    return filtered
+
+
 def rank_songs(songs: list[tuple[str, str]]) -> list[tuple[str, str, int]]:
     """
     Count plays per unique (artist, title) pair (case-insensitive key).
@@ -143,14 +259,21 @@ def rank_songs(songs: list[tuple[str, str]]) -> list[tuple[str, str, int]]:
 
 
 def yt_call(fn, *args, retries: int = 3, backoff: float = 15.0, **kwargs):
-    """Call a ytmusicapi function, retrying on JSONDecodeError (rate-limit / empty response)."""
+    """Call a ytmusicapi function, retrying on JSONDecodeError or HTTP 409 Conflict."""
     for attempt in range(retries):
         try:
             return fn(*args, **kwargs)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as e:
             if attempt < retries - 1:
                 wait = backoff * (attempt + 1)
                 print(f"  Rate-limited, waiting {wait:.0f}s before retry {attempt + 1}/{retries - 1}...")
+                time.sleep(wait)
+            else:
+                raise
+        except Exception as e:
+            if "409" in str(e) and attempt < retries - 1:
+                wait = backoff * (attempt + 1)
+                print(f"  HTTP 409 Conflict, waiting {wait:.0f}s before retry {attempt + 1}/{retries - 1}...")
                 time.sleep(wait)
             else:
                 raise
@@ -174,14 +297,43 @@ def clear_playlist(yt, playlist_id: str) -> None:
         print(f"  Cleared {len(tracks)} existing songs.")
 
 
+def verify_playlist_updated(
+    yt,
+    playlist_id: str,
+    expected_count: int,
+    retries: int = 8,
+    interval: float = 10.0,
+) -> bool:
+    """Poll until the playlist contains at least expected_count tracks, or give up after retries."""
+    for attempt in range(1, retries + 1):
+        playlist = yt_call(yt.get_playlist, playlist_id, limit=10000)
+        actual = len(playlist.get("tracks") or [])
+        if actual >= expected_count:
+            if attempt > 1:
+                print(f"  Playlist verified: {actual} tracks present (after {attempt} checks).")
+            else:
+                print(f"  Playlist verified: {actual} tracks present.")
+            return True
+        print(f"  Verification {attempt}/{retries}: {actual}/{expected_count} tracks visible, waiting {interval:.0f}s…")
+        time.sleep(interval)
+    print(f"  Warning: playlist may not have updated fully (expected {expected_count} tracks).", file=sys.stderr)
+    return False
+
+
 def create_station_playlist(
     yt,
     station_name: str,
     ranked: list[tuple[str, str, int]],
     today: str,
-) -> None:
-    """Search each song on YouTube Music and add to a new or existing playlist for this station."""
-    desc = f"Most played songs on {station_name} — {len(ranked)} songs, updated {today}, ordered by number of plays."
+    language_label: str | None = None,
+) -> tuple[str, int, int, bool, list[str]] | None:
+    """Search each song on YouTube Music and add to a new or existing playlist for this station.
+    Returns (playlist_url, tracks_added, total_unique, verified, skipped_names) or None if playlist could not be created."""
+    TARGET = 100
+    total_unique = len(ranked)
+    desc = f"Most played songs on {station_name} — top {TARGET} of {total_unique} unique tracks played yesterday, updated {today}, ordered by number of plays."
+    if language_label:
+        desc += f" Tracks in {language_label} only."
 
     existing_id = find_existing_playlist(yt, station_name)
     if existing_id:
@@ -200,43 +352,77 @@ def create_station_playlist(
             playlist_id = find_existing_playlist(yt, station_name)
             if playlist_id is None:
                 print(f"  Could not create or find playlist {station_name!r}. Skipping.", file=sys.stderr)
-                return
+                return None
             print(f"  Found existing playlist on retry.")
             yt_call(yt.edit_playlist, playlist_id, description=desc)
             clear_playlist(yt, playlist_id)
     print(f"  URL: https://music.youtube.com/playlist?list={playlist_id}")
 
-    video_ids: list[str] = []
     not_found: list[str] = []
+    skipped_names: list[str] = []
+    tracks_confirmed = 0
+    verified = True
 
-    print(f"  Searching {len(ranked)} songs...")
+    print(f"  Searching songs until {TARGET} are added (pool: {total_unique} unique tracks)...")
     for artist, title, count in ranked:
+        if tracks_confirmed >= TARGET:
+            break
+
+        # Search
         query = f"{artist} {title}"
         results = None
-        try:
-            results = yt_call(yt.search, query, filter="songs", limit=1)
-        except Exception as e:
-            print(f"  [{count:2}x] {artist} - {title}  [SEARCH ERROR: {e}]")
-        if results:
-            video_ids.append(results[0]["videoId"])
-            found_title = results[0].get("title", "?")
-            found_artist = (results[0].get("artists") or [{}])[0].get("name", "?")
-            print(f"  [{count:2}x] {artist} - {title} → {found_artist} - {found_title}")
-        elif results is not None:
-            print(f"  [{count:2}x] {artist} - {title}  [NOT FOUND]")
-            not_found.append(f"{artist} - {title}")
-        time.sleep(0.5)
+        for search_attempt in range(3):
+            try:
+                results = yt_call(yt.search, query, filter="songs", limit=1)
+            except Exception as e:
+                print(f"  [{count:2}x] {artist} - {title}  [SEARCH ERROR: {e}]")
+                break
+            if results:
+                break
+            if search_attempt < 2:
+                wait = 20.0 * (search_attempt + 1)
+                print(f"  [{count:2}x] {artist} - {title}  [empty, retrying in {wait:.0f}s…]")
+                time.sleep(wait)
+        if not results:
+            if results is not None:
+                print(f"  [{count:2}x] {artist} - {title}  [NOT FOUND]")
+                not_found.append(f"{artist} - {title}")
+            time.sleep(1.5)
+            continue
 
-    if video_ids:
-        for i in range(0, len(video_ids), 200):
-            yt_call(yt.add_playlist_items, playlist_id, video_ids[i : i + 200])
-        print(f"  Added {len(video_ids)} songs.")
-    else:
-        print("  No songs found on YouTube Music.")
+        vid = results[0]["videoId"]
+        found_title = results[0].get("title", "?")
+        found_artist = (results[0].get("artists") or [{}])[0].get("name", "?")
+        print(f"  [{count:2}x] {artist} - {title} → {found_artist} - {found_title}")
+        time.sleep(1.5)
+
+        # Upload
+        track_name = f"{artist} - {title}"
+        track_ok = False
+        for attempt in range(3):
+            if attempt > 0:
+                print(f"  Track not confirmed — retry {attempt}/2...")
+            yt_call(yt.add_playlist_items, playlist_id, [vid])
+            if verify_playlist_updated(yt, playlist_id, tracks_confirmed + 1):
+                tracks_confirmed += 1
+                track_ok = True
+                break
+        if not track_ok:
+            print(f"  Warning: {track_name} could not be confirmed after 2 retries — skipping.", file=sys.stderr)
+            skipped_names.append(track_name)
+            verified = False
+
+    print(f"  Added {tracks_confirmed} songs ({len(skipped_names)} skipped, {len(not_found)} not found on YT Music).")
+    final_desc = f"Most played songs on {station_name} — top {tracks_confirmed} of {total_unique} unique tracks played yesterday, updated {today}, ordered by number of plays."
+    if language_label:
+        final_desc += f" Tracks in {language_label} only."
+    yt_call(yt.edit_playlist, playlist_id, description=final_desc)
 
     if not_found:
-        print(f"  {len(not_found)} not found: {', '.join(not_found[:5])}" +
-              (" ..." if len(not_found) > 5 else ""))
+        print(f"  Not found: {', '.join(not_found[:5])}" + (" ..." if len(not_found) > 5 else ""))
+
+    playlist_url = f"https://music.youtube.com/playlist?list={playlist_id}"
+    return (playlist_url, tracks_confirmed, total_unique, verified, skipped_names)
 
 
 def notify_telegram(msg: str, config: dict) -> None:
@@ -257,9 +443,9 @@ def notify_telegram(msg: str, config: dict) -> None:
         print(f"[Notification] {msg}")
 
 
-def format_top10_message(station_name: str, ranked: list[tuple[str, str, int]], today: str) -> str:
-    lines = [f"📻 {station_name} — top 10 ({today})"]
-    for i, (artist, title, count) in enumerate(ranked[:10], 1):
+def format_top30_message(station_name: str, ranked: list[tuple[str, str, int]], today: str) -> str:
+    lines = [f"📻 {station_name} — top 30 ({today})"]
+    for i, (artist, title, count) in enumerate(ranked[:30], 1):
         lines.append(f"{i:2}. [{count:2}x] {artist} - {title}")
     return "\n".join(lines)
 
@@ -292,22 +478,34 @@ def main() -> None:
     config = read_config(CONFIG_FILE)
 
     try:
-        urls = read_urls(URL_FILE)
+        station_entries = read_urls(URL_FILE)
     except FileNotFoundError:
         print(f"Error: {URL_FILE} not found.", file=sys.stderr)
         sys.exit(1)
 
-    if not urls:
+    if not station_entries:
         print(f"Error: no URLs found in {URL_FILE}.", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Found {len(urls)} station URLs")
+    print(f"Found {len(station_entries)} station URLs")
+
+    if not wait_for_network():
+        print("Error: network unavailable after all retries. Aborting.", file=sys.stderr)
+        sys.exit(1)
+
+    # Build language detector once if any station has language_detection enabled
+    any_language_detection = any(e.get("language_detection", False) for e in station_entries)
+    language_detector = build_language_detector() if any_language_detection else None
+    if any_language_detection and language_detector is not None:
+        print("Language filtering enabled for applicable stations.")
 
     # Scrape each station separately
     session = requests.Session()
-    stations: list[tuple[str, list[tuple[str, str]]]] = []
+    stations: list[tuple[str, list[tuple[str, str]], str | None]] = []
+    failed_urls: list[tuple[str, str]] = []  # (url, station_name)
 
-    for i, url in enumerate(urls):
+    for i, entry in enumerate(station_entries):
+        url = entry["url"]
         if i > 0:
             delay = random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX)
             print(f"  (waiting {delay:.1f}s…)")
@@ -317,9 +515,22 @@ def main() -> None:
         print(f"  {station_name}: {len(songs)} entries")
         if not songs:
             print("  (no playlist data — station may not be tracked, or temporary block)")
-        stations.append((station_name, songs))
+            failed_urls.append((url, station_name))
+        lang_label: str | None = None
+        if language_detector is not None and entry.get("language_detection", False):
+            country = _country_from_url(url)
+            songs = filter_songs_by_language(songs, country, language_detector)
+            print(f"  After language filter: {len(songs)} entries")
+            lang_label = _language_label_for_country(country)
+        stations.append((station_name, songs, lang_label))
 
-    stations_with_data = [(name, songs) for name, songs in stations if songs]
+    if failed_urls:
+        lines = [f"⚠️ No playlist data returned for {len(failed_urls)} station(s):"]
+        for url, name in failed_urls:
+            lines.append(f"\n📻 {name}\n   {url}")
+        notify_telegram("\n".join(lines), config)
+
+    stations_with_data = [(name, songs, lang_label) for name, songs, lang_label in stations if songs]
     if not stations_with_data:
         print("\nNo songs scraped from any station.", file=sys.stderr)
         sys.exit(1)
@@ -327,12 +538,12 @@ def main() -> None:
     # Print summary per station
     today = datetime.now().strftime("%Y-%m-%d")
     print(f"\n{'='*60}")
-    for station_name, songs in stations_with_data:
+    for station_name, songs, lang_label in stations_with_data:
         ranked = rank_songs(songs)
         print(f"\n{station_name} — top 10 (of {len(ranked)} unique tracks):")
         for j, (artist, title, count) in enumerate(ranked[:10], 1):
             print(f"  {j:2}. [{count:2}x] {artist} - {title}")
-        msg = format_top10_message(station_name, ranked, today)
+        msg = format_top30_message(station_name, ranked, today)
         notify_telegram(msg, config)
 
     # Connect to YouTube Music once for all stations
@@ -353,11 +564,39 @@ def main() -> None:
 
     # Create one playlist per station
     print(f"\n{'='*60}")
-    for station_name, songs in stations_with_data:
+    playlist_results: list[tuple[str, str, int, int]] = []  # (station_name, url, added, total_unique)
+    failed_playlists: list[tuple[str, str]] = []  # (station_name, reason)
+    for station_name, songs, lang_label in stations_with_data:
         ranked = rank_songs(songs)
-        create_station_playlist(yt, station_name, ranked, today)
+        result = create_station_playlist(yt, station_name, ranked, today, language_label=lang_label)
+        if result:
+            url, added, total_unique, verified, skipped_names = result
+            playlist_results.append((station_name, url, added, total_unique))
+            if skipped_names:
+                lines = [f"⚠️ {station_name}: {len(skipped_names)} track(s) could not be added after 2 retries:"]
+                for name in skipped_names:
+                    lines.append(f"  • {name}")
+                notify_telegram("\n".join(lines), config)
+            if not verified and not skipped_names:
+                failed_playlists.append((station_name, "playlist did not reflect update in time"))
+        else:
+            failed_playlists.append((station_name, "could not create or find playlist"))
 
     print("\nDone!")
+
+    if playlist_results:
+        lines = ["✅ YouTube Music playlists updated:"]
+        for station_name, url, added, total_unique in playlist_results:
+            lines.append(f"\n📻 {station_name}")
+            lines.append(f"   Top {added} of {total_unique} unique tracks")
+            lines.append(f"   {url}")
+        notify_telegram("\n".join(lines), config)
+
+    if failed_playlists:
+        lines = [f"❌ Playlist update failed for {len(failed_playlists)} station(s):"]
+        for station_name, reason in failed_playlists:
+            lines.append(f"\n📻 {station_name}: {reason}")
+        notify_telegram("\n".join(lines), config)
 
 
 if __name__ == "__main__":
