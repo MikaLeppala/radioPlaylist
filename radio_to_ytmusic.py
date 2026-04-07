@@ -254,7 +254,7 @@ def rank_songs(songs: list[tuple[str, str]]) -> list[tuple[str, str, int]]:
         if key not in originals:
             originals[key] = (artist, title)
 
-    ranked = sorted(counts.items(), key=lambda x: (-x[1], x[0][0], x[0][1]))
+    ranked = sorted(counts.items(), key=lambda x: (-x[1], random.random()))
     return [(originals[k][0], originals[k][1], v) for k, v in ranked]
 
 
